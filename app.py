@@ -57,23 +57,25 @@ async def generate_summary(messages):
     if not messages:
         return "Нет сообщений для саммари."
 
+    # Build readable lines
     lines = []
     for m in messages:
         t = (m.get("text") or "").strip()
-        if t:
-            lines.append(f"[{m['timestamp'].strftime('%H:%M')}] {m['user']}: {t}")
+        if not t:
+            continue
+        lines.append(f"[{m['timestamp'].strftime('%H:%M')}] {m['user']}: {t}")
 
     if not lines:
         return "Нет текстовых сообщений."
 
-    # Split into safe blocks
+    # Chunking to avoid 413 / token limits
     blocks = []
     current = []
     current_tokens = 0
     max_tokens_per_block = 3200
 
     for line in lines:
-        est = max(1, len(line) // 4)
+        est = max(1, len(line) // 4)  # rough token estimate
         if current and current_tokens + est > max_tokens_per_block:
             blocks.append("\n".join(current))
             current = [line]
@@ -87,26 +89,24 @@ async def generate_summary(messages):
 
     client = Groq(api_key=GROQ_API_KEY)
 
-    # ---------- PARTIAL SUMMARIES ----------
+    # ---------- PARTIAL SUMMARIES (internal) ----------
     partials = []
 
-    partial_prompt_tpl = """Ты делаешь ОЧЕНЬ краткое резюме ЧАСТИ мамского чата.
+    partial_prompt_tpl = """Сделай короткую выжимку ЧАСТИ дружеского чата.
 
-ЖЁСТКИЕ ПРАВИЛА:
-- НИЧЕГО НЕ ВЫДУМЫВАЙ.
-- НЕ добавляй упоминания без конкретики.
-- "Блины на районе", "косметичка", "магазин" БЕЗ:
-  что именно + где/как найти → НЕ добавлять.
-- Ссылки игнорируй, если это не явная рекомендация.
-- Рекомендация = конкретный объект + где + почему нравится.
-- Консенсус = минимум 2 человека ("я тоже", "беру", "заказала").
+Правила:
+- Без слащавости, без пожеланий.
+- Не выдумывай. Если данных нет — не добавляй.
+- Болтовню не превращай в "рекомендации".
+- Полезное фиксируй только если есть конкретика: что именно + где/как найти/ссылка.
+- Покупки фиксируй только если видно, что это реально берут/заказали/решили ("беру", "заказала", "мы берем", "в итоге") и есть что+где.
+- Ссылки упоминать только если они в сообщениях реально есть (или явно указан магазин/место/приложение/название).
 
-Формат:
-- Подтверждённые рекомендации (2+ человек, с конкретикой):
-- Одиночные рекомендации (ТОЛЬКО если явно "советую" и есть конкретика):
-- Итоги / массовые покупки:
-- Цены / скидки / конкретика:
-- Болталка (1 строка):
+Верни строго:
+1) Что обсуждали (1–3 строки)
+2) Покупки (0–3 пункта с конкретикой; если нет — "— нет")
+3) Полезное/куда идти (0–3 пункта; если нет — "— нет")
+4) Планы/договорённости (если нет — "— нет")
 
 Сообщения:
 {block}
@@ -116,42 +116,55 @@ async def generate_summary(messages):
         completion = client.chat.completions.create(
             messages=[{"role": "user", "content": partial_prompt_tpl.format(block=block)}],
             model="llama-3.3-70b-versatile",
-            temperature=0.2,
-            max_tokens=600,
+            temperature=0.25,
+            max_tokens=700,
         )
         partials.append(completion.choices[0].message.content)
 
-    # ---------- FINAL SUMMARY ----------
-    final_prompt = f"""Ты объединяешь несколько резюме частей мамского чата в ОДНО итоговое summary.
+    # ---------- FINAL SUMMARY (only this is posted) ----------
+    final_prompt = f"""Сделай итоговое резюме дружеского чата: человечно, но по делу.
 
-ЖЁСТКИЕ ПРАВИЛА:
-- НИЧЕГО НЕ ВЫДУМЫВАЙ.
-- Если нет конкретики (что + где) — НЕ добавляй.
-- Если нет консенсуса или явного "советую" — НЕ добавляй.
-- Ссылки выводи ТОЛЬКО если это подтверждённая рекомендация или итог покупки.
-- Максимум 10–15 ссылок на ВСЁ summary.
-- Если раздел пуст — пиши "— нет".
+Тон:
+- Нормальный человеческий, без "привет", без "желаю хорошего дня", без сюсюканья.
+- Можно лёгкую иронию, но без пафоса.
 
-ФОРМАТ (строго):
-Mood: одна короткая строка.
+Жёсткие правила:
+- Не выдумывай факты.
+- Не расписывай "кто что сказал" списком. Имена — максимум 0–3 за весь текст, только если реально нужно.
+- "Краши/актёры/мемы" = просто сюжет дня (1–2 строки), НЕ рекомендации.
+- Покупки добавляй только если есть сигнал, что это реально берут/заказали/решили ("беру", "заказала", "мы берем", "в итоге") И есть конкретика (что + где/ссылка/магазин). Иначе не добавляй.
+- Полезное включай только если есть конкретика (что именно + где/как найти) или реальная ссылка.
+- Ссылки: включай ТОЛЬКО если они в сообщениях реально были и выглядят полезными (пост, магазин, сервис, запись). Не более 1–5 ссылок. Ничего не придумывай.
 
-Полезное:
-- Подтверждённые рекомендации (2+ человек, с конкретикой): ...
-- Итоги / массовые покупки (что именно и где): ...
-- Одиночные рекомендации (явно "советую", с конкретикой): ...
-- Цены / скидки / конкретика: ...
+Формат (строго):
+Заголовок: коротко и по теме (без эмодзи или максимум 1).
 
-Болталка (1–2 строки): ...
+Mood: 1 строка.
 
-Резюме частей:
+По сути:
+- 3–8 пунктов: что реально обсуждали и что из этого важно/интересно.
+
+Покупки (если были):
+- 0–5 пунктов. Если не было — "— не было".
+
+Полезное/куда идти (если было):
+- 0–5 пунктов с конкретикой. Если не было — "— не было".
+
+Ссылки (если были):
+- 0–5 строк. Если ссылок не было — "— не было".
+
+Планы/договорённости:
+- если были; иначе "— не было".
+
+Материал (резюме частей):
 {chr(10).join(partials)}
 """
 
     completion = client.chat.completions.create(
         messages=[{"role": "user", "content": final_prompt}],
         model="llama-3.3-70b-versatile",
-        temperature=0.4,
-        max_tokens=900,
+        temperature=0.45,
+        max_tokens=1000,
     )
     return completion.choices[0].message.content
 
@@ -161,14 +174,13 @@ Mood: одна короткая строка.
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Я делаю итоговые саммари чата.\n\n"
+        "Резюме чата без сюсюканья: по делу + человеческим языком.\n\n"
         "Команды:\n"
         "/summary — за 24 часа\n"
         "/summary_custom N — за N часов\n"
         "/summary_days N — за N дней\n"
-        "/enable_auto — авто-саммари\n"
-        "/disable_auto — отключить авто-саммари\n\n"
-        "Я НЕ отвечаю на обычные сообщения."
+        "/enable_auto — авто-саммари в 01:00 (для этого чата)\n"
+        "/disable_auto — отключить авто-саммари"
     )
 
 
@@ -198,55 +210,76 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text("⏳ Готовлю саммари...")
+    await update.message.reply_text("⏳ Делаю саммари...")
     msgs = get_messages_by_timeframe(chat_id, 24)
     if not msgs:
-        await update.message.reply_text("Нет сообщений.")
+        await update.message.reply_text("📭 Нет сообщений за период.")
         return
     summary = await generate_summary(msgs)
-    await update.message.reply_text(summary, parse_mode="Markdown")
+    await update.message.reply_text(summary)
 
 
 async def summary_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     try:
-        hours = int(context.args[0])
+        hours = int(context.args[0]) if context.args else 24
+        if hours < 1 or hours > 168:
+            raise ValueError()
     except Exception:
-        await update.message.reply_text("Пример: /summary_custom 12")
+        await update.message.reply_text("Пример: /summary_custom 12 (1..168 часов)")
         return
+
+    await update.message.reply_text(f"⏳ Саммари за {hours}ч...")
     msgs = get_messages_by_timeframe(chat_id, hours)
+    if not msgs:
+        await update.message.reply_text("📭 Нет сообщений за период.")
+        return
     summary = await generate_summary(msgs)
-    await update.message.reply_text(summary, parse_mode="Markdown")
+    await update.message.reply_text(summary)
 
 
 async def summary_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     try:
-        days = int(context.args[0])
+        days = int(context.args[0]) if context.args else 1
+        if days < 1 or days > 30:
+            raise ValueError()
     except Exception:
-        await update.message.reply_text("Пример: /summary_days 7")
+        await update.message.reply_text("Пример: /summary_days 7 (1..30 дней)")
         return
+
+    await update.message.reply_text(f"⏳ Саммари за {days}д...")
     msgs = get_messages_by_timeframe(chat_id, days * 24)
+    if not msgs:
+        await update.message.reply_text("📭 Нет сообщений за период.")
+        return
     summary = await generate_summary(msgs)
-    await update.message.reply_text(summary, parse_mode="Markdown")
+    await update.message.reply_text(summary)
 
 
 async def enable_auto_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     auto_summary_chats.add(update.effective_chat.id)
-    await update.message.reply_text("✅ Авто-саммари включено.")
+    await update.message.reply_text("✅ Авто-саммари включено для этого чата (01:00 по времени сервера).")
 
 
 async def disable_auto_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     auto_summary_chats.discard(update.effective_chat.id)
-    await update.message.reply_text("❌ Авто-саммари выключено.")
+    await update.message.reply_text("❌ Авто-саммари выключено для этого чата.")
 
 
 async def send_auto_summary(ptb: Application):
+    if not auto_summary_chats:
+        return
+
     for chat_id in list(auto_summary_chats):
         msgs = get_messages_by_timeframe(chat_id, 24)
-        if msgs:
-            summary = await generate_summary(msgs)
-            await ptb.bot.send_message(chat_id=chat_id, text=summary, parse_mode="Markdown")
+        if not msgs:
+            continue
+        summary = await generate_summary(msgs)
+        try:
+            await ptb.bot.send_message(chat_id=chat_id, text=summary)
+        except Exception as e:
+            print(f"❌ Auto-summary send error for {chat_id}: {e}")
 
 
 async def schedule_daily_summary(ptb: Application):
@@ -283,19 +316,30 @@ async def on_startup():
     asyncio.create_task(schedule_daily_summary(ptb_app))
 
     if BASE_URL:
-        await ptb_app.bot.set_webhook(f"{BASE_URL}/telegram/{WEBHOOK_SECRET}")
+        webhook_url = f"{BASE_URL}/telegram/{WEBHOOK_SECRET}"
+        await ptb_app.bot.set_webhook(url=webhook_url)
+        print(f"✅ Webhook set: {webhook_url}")
+    else:
+        print("⚠️ BASE_URL is not set yet. Webhook not configured.")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await ptb_app.stop()
+    await ptb_app.shutdown()
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
 
 
 @app.post("/telegram/{secret}")
 async def telegram_webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         return {"ok": False}
-    data = await request.json()
-    update = Update.de_json(data, ptb_app.bot)
+
+    payload = await request.json()
+    update = Update.de_json(payload, ptb_app.bot)
     await ptb_app.process_update(update)
-    return {"ok": True}
-
-
-@app.get("/health")
-async def health():
     return {"ok": True}
