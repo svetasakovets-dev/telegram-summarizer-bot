@@ -30,58 +30,23 @@ if not GROQ_API_KEY:
 # =========================
 # BOT STATE (IN-MEMORY)
 # =========================
-AUTO_SUMMARY_CHAT_ID = None
+# Messages per chat_id
 channel_messages = {}
 
+# Chats where auto-summary is enabled
+auto_summary_chats = set()
+
 
 # =========================
-# HANDLERS
+# HELPERS
 # =========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-
-    global AUTO_SUMMARY_CHAT_ID
-    if AUTO_SUMMARY_CHAT_ID is None:
-        AUTO_SUMMARY_CHAT_ID = chat_id
-        print(f"✅ Auto-summary enabled for chat ID: {chat_id}")
-
-    await update.message.reply_text(
-        "👋 Привет! Я бот-суммаризатор.\n\n"
-        "Команды:\n"
-        "/summary — summary за 24 часа\n"
-        "/summary_yesterday — summary за вчера (24–48ч назад)\n"
-        "/summary_custom N — summary за N часов\n"
-        "/clear — очистить сохраненные сообщения\n"
-        "/enable_auto — включить авто-summary в 01:00 (время сервера)\n"
-        "/disable_auto — выключить авто-summary\n"
-    )
-
-
-async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.channel_post or update.message
-    if not msg:
-        return
-
-    # ignore commands
-    if msg.text and msg.text.startswith("/"):
-        return
-
-    chat_id = msg.chat.id
-    channel_messages.setdefault(chat_id, [])
-
-    # username / source
-    if update.message:  # group message
-        user = msg.from_user.username or msg.from_user.first_name or "Unknown"
-    else:  # channel post
-        user = msg.sender_chat.title if msg.sender_chat else "Channel"
-
-    channel_messages[chat_id].append(
-        {
-            "text": msg.text or msg.caption or "",
-            "timestamp": msg.date,
-            "user": user,
-        }
-    )
+def _chat_label(chat) -> str:
+    try:
+        if chat.title:
+            return chat.title
+    except Exception:
+        pass
+    return str(chat.id)
 
 
 def get_messages_by_timeframe(chat_id: int, hours: int = 24):
@@ -89,8 +54,9 @@ def get_messages_by_timeframe(chat_id: int, hours: int = 24):
     if not messages:
         return []
 
+    # Use tz from Telegram timestamps if present
     tz = messages[-1]["timestamp"].tzinfo
-    now = datetime.now(tz=tz)
+    now = datetime.now(tz=tz) if tz else datetime.now()
     cutoff = now - timedelta(hours=hours)
 
     return [m for m in messages if m["timestamp"] >= cutoff]
@@ -138,6 +104,50 @@ async def generate_summary(messages):
         return f"❌ Error generating summary: {e}"
 
 
+# =========================
+# HANDLERS
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Привет! Я бот-суммаризатор.\n\n"
+        "Команды (работают в рамках текущего чата):\n"
+        "/summary — summary за 24 часа\n"
+        "/summary_yesterday — summary за вчера (24–48ч назад)\n"
+        "/summary_custom N — summary за N часов\n"
+        "/clear — очистить сохраненные сообщения\n"
+        "/enable_auto — включить авто-summary в 01:00 (для ЭТОГО чата)\n"
+        "/disable_auto — выключить авто-summary (для ЭТОГО чата)\n\n"
+        "ℹ️ Важно: я отвечаю на команды, а обычные сообщения я просто сохраняю для summary."
+    )
+
+
+async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.channel_post or update.message
+    if not msg:
+        return
+
+    # Ignore commands
+    if msg.text and msg.text.startswith("/"):
+        return
+
+    chat_id = msg.chat.id
+    channel_messages.setdefault(chat_id, [])
+
+    # Username / source
+    if update.message and msg.from_user:
+        user = msg.from_user.username or msg.from_user.first_name or "Unknown"
+    else:
+        user = msg.sender_chat.title if msg.sender_chat else "Channel"
+
+    channel_messages[chat_id].append(
+        {
+            "text": msg.text or msg.caption or "",
+            "timestamp": msg.date,
+            "user": user,
+        }
+    )
+
+
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text("⏳ Генерирую summary...")
@@ -164,7 +174,7 @@ async def summary_yesterday(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tz = all_msgs[-1]["timestamp"].tzinfo
-    now = datetime.now(tz=tz)
+    now = datetime.now(tz=tz) if tz else datetime.now()
 
     start = now - timedelta(hours=48)
     end = now - timedelta(hours=24)
@@ -214,36 +224,44 @@ async def clear_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def enable_auto_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global AUTO_SUMMARY_CHAT_ID
-    AUTO_SUMMARY_CHAT_ID = update.effective_chat.id
-    await update.message.reply_text("✅ Авто-summary включено (01:00 по времени сервера).")
+    chat_id = update.effective_chat.id
+    auto_summary_chats.add(chat_id)
+    await update.message.reply_text(
+        "✅ Авто-summary включено для ЭТОГО чата.\n"
+        "Я буду отправлять daily summary в 01:00 (по времени сервера)."
+    )
+    print(f"✅ Auto-summary enabled for chat: {chat_id}")
 
 
 async def disable_auto_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global AUTO_SUMMARY_CHAT_ID
-    AUTO_SUMMARY_CHAT_ID = None
-    await update.message.reply_text("❌ Авто-summary выключено.")
+    chat_id = update.effective_chat.id
+    auto_summary_chats.discard(chat_id)
+    await update.message.reply_text("❌ Авто-summary выключено для ЭТОГО чата.")
+    print(f"❌ Auto-summary disabled for chat: {chat_id}")
 
 
 async def send_auto_summary(ptb: Application):
-    global AUTO_SUMMARY_CHAT_ID
-    if AUTO_SUMMARY_CHAT_ID is None:
+    if not auto_summary_chats:
+        print("⏭️ Skipping auto-summary: no chats enabled")
         return
 
-    msgs = get_messages_by_timeframe(AUTO_SUMMARY_CHAT_ID, hours=24)
-    if not msgs:
-        return
+    for chat_id in list(auto_summary_chats):
+        msgs = get_messages_by_timeframe(chat_id, hours=24)
+        if not msgs:
+            print(f"📭 No messages for chat {chat_id}")
+            continue
 
-    summary = await generate_summary(msgs)
+        summary = await generate_summary(msgs)
 
-    try:
-        await ptb.bot.send_message(
-            chat_id=AUTO_SUMMARY_CHAT_ID,
-            text=f"🌙 **Daily Summary**\n📅 24 часа — {len(msgs)} сообщений\n\n{summary}",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        print(f"❌ Error sending auto-summary: {e}")
+        try:
+            await ptb.bot.send_message(
+                chat_id=chat_id,
+                text=f"🌙 **Daily Summary**\n📅 24 часа — {len(msgs)} сообщений\n\n{summary}",
+                parse_mode="Markdown",
+            )
+            print(f"✅ Auto-summary sent to chat {chat_id}")
+        except Exception as e:
+            print(f"❌ Error sending auto-summary to {chat_id}: {e}")
 
 
 async def schedule_daily_summary(ptb: Application):
@@ -270,7 +288,7 @@ ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
 @app.on_event("startup")
 async def on_startup():
-    # handlers
+    # Commands
     ptb_app.add_handler(CommandHandler("start", start))
     ptb_app.add_handler(CommandHandler("summary", summary_command))
     ptb_app.add_handler(CommandHandler("summary_yesterday", summary_yesterday))
@@ -279,17 +297,16 @@ async def on_startup():
     ptb_app.add_handler(CommandHandler("enable_auto", enable_auto_summary))
     ptb_app.add_handler(CommandHandler("disable_auto", disable_auto_summary))
 
-    ptb_app.add_handler(
-        MessageHandler(filters.ChatType.CHANNEL | filters.ChatType.GROUPS, collect_message)
-    )
+    # Collect ANY message except commands (works reliably in supergroups too)
+    ptb_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_message))
 
     await ptb_app.initialize()
     await ptb_app.start()
 
-    # scheduler
+    # Scheduler
     asyncio.create_task(schedule_daily_summary(ptb_app))
 
-    # webhook
+    # Webhook
     if BASE_URL:
         webhook_url = f"{BASE_URL}/telegram/{WEBHOOK_SECRET}"
         await ptb_app.bot.set_webhook(url=webhook_url)
