@@ -30,8 +30,11 @@ if not GROQ_API_KEY:
 # =========================
 # BOT STATE (IN-MEMORY)
 # =========================
-channel_messages = {}          # messages per chat_id
-auto_summary_chats = set()     # chats where auto-summary is enabled
+# Messages per chat_id
+channel_messages = {}
+
+# Chats where auto-summary is enabled
+auto_summary_chats = set()
 
 
 # =========================
@@ -45,73 +48,111 @@ def get_messages_by_timeframe(chat_id: int, hours: int = 24):
     tz = messages[-1]["timestamp"].tzinfo
     now = datetime.now(tz=tz) if tz else datetime.now()
     cutoff = now - timedelta(hours=hours)
-
     return [m for m in messages if m["timestamp"] >= cutoff]
 
 
 async def generate_summary(messages):
+    """
+    IMPORTANT:
+    - For active chats this runs hierarchical summarization:
+      it creates internal mini-summaries in chunks (NOT posted to Telegram),
+      then returns ONE final summary to post in chat.
+    """
     if not messages:
         return "No messages to summarize."
 
-    messages_text = "\n\n".join(
-        f"[{m['timestamp'].strftime('%H:%M')}] {m['user']}: {m['text']}"
-        for m in messages
-        if m.get("text")
-    )
+    # Collect readable lines
+    lines = []
+    for m in messages:
+        t = (m.get("text") or "").strip()
+        if not t:
+            continue
+        lines.append(f"[{m['timestamp'].strftime('%H:%M')}] {m['user']}: {t}")
 
-    if not messages_text.strip():
+    if not lines:
         return "No text messages found to summarize."
 
-    try:
-        client = Groq(api_key=GROQ_API_KEY)
+    # Split into blocks to avoid Groq request-too-large (413)
+    blocks = []
+    current = []
+    current_tokens = 0
+    max_tokens_per_block = 3200  # safe-ish block size
 
-        prompt = f"""Ты делаешь краткое резюме мамского чата за период.
+    for line in lines:
+        est = max(1, len(line) // 4)  # rough tokens estimate
+        if current and current_tokens + est > max_tokens_per_block:
+            blocks.append("\n".join(current))
+            current = [line]
+            current_tokens = est
+        else:
+            current.append(line)
+            current_tokens += est
 
-ВАЖНО (включай в summary ТОЛЬКО если есть рекомендация или итог обсуждения):
-1) Массовые закупки / покупки:
-   - что В ИТОГЕ решили покупать
-   - если несколько человек поддержали выбор
-   - ссылку указывать ТОЛЬКО для итогового варианта
-2) Рекомендации:
-   - врачи / клиники / анализы / прививки
-   - товары / сервисы
-   - обязательно кратко: за что хвалят или за что ругают
-3) Полезная конкретика:
-   - списки, чек-листы
-   - цены, сроки, контакты
-   - где купить / как заказать
+    if current:
+        blocks.append("\n".join(current))
 
-НЕ ВАЖНО (сжать до минимума, не перечислять подробно):
-- одиночные ссылки без поддержки
-- варианты, по которым не договорились
-- болтовня, эмоции, small talk
+    client = Groq(api_key=GROQ_API_KEY)
 
-ФОРМАТ ОТВЕТА (строго):
-Mood: одна короткая строка про общий настрой чата.
+    # 1) Internal partial summaries (NOT sent to Telegram)
+    partials = []
+    partial_prompt_tpl = """Ты делаешь краткое резюме ЧАСТИ мамского чата.
 
-Полезное:
-- Массовые покупки / что решили брать: ...
-- Рекомендации (врачи / товары): ...
-- Полезные списки и конкретика: ...
+Вытащи только полезное:
+- рекомендации (врачи/товары/сервисы) с коротким "почему"
+- массовые покупки / итог выбора (если виден консенсус: "я тоже", "беру", "заказала" и т.п.)
+- конкретику (цены, сроки, контакты, чек-листы)
+Случайные одиночные ссылки без поддержки — не включай.
 
-Болталка (1–2 строки): ...
+Верни очень коротко и структурировано:
+- Рекомендации:
+- Покупки/итоги:
+- Конкретика:
+- Болталка (1 строка):
 
 Сообщения:
-{messages_text}
-
-Ответ дай дружелюбно и структурировано (пункты/подзаголовки).
+{block}
 """
 
+    for block in blocks:
         completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": partial_prompt_tpl.format(block=block)}],
             model="llama-3.3-70b-versatile",
-            temperature=0.5,
-            max_tokens=1024,
+            temperature=0.2,
+            max_tokens=600,
         )
-        return completion.choices[0].message.content
+        partials.append(completion.choices[0].message.content)
 
-    except Exception as e:
-        return f"❌ Error generating summary: {e}"
+    # 2) Final summary (THIS is the only thing posted to Telegram)
+    final_prompt = f"""Ты объединяешь несколько кратких резюме частей мамского чата в ОДНО итоговое summary.
+
+Правила:
+- Повторы объединяй.
+- Считай "итог/массовая покупка" только если видно поддержку нескольких людей (пример: "я тоже", "беру", "заказала").
+- Ссылку указывай ТОЛЬКО если это рекомендация/итог/массовая покупка.
+- Болталку сжать до 1–2 строк.
+- Добавь Mood одной строкой.
+
+Формат (строго):
+Mood: одна короткая строка.
+
+Полезное:
+- Массовые покупки / что решили брать:
+- Рекомендации (врачи / товары / сервисы):
+- Полезные списки и конкретика:
+
+Болталка (1–2 строки):
+
+Резюме частей:
+{chr(10).join(partials)}
+"""
+
+    completion = client.chat.completions.create(
+        messages=[{"role": "user", "content": final_prompt}],
+        model="llama-3.3-70b-versatile",
+        temperature=0.4,
+        max_tokens=900,
+    )
+    return completion.choices[0].message.content
 
 
 # =========================
@@ -124,7 +165,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/summary — summary за 24 часа\n"
         "/summary_yesterday — summary за вчера (24–48ч назад)\n"
         "/summary_custom N — summary за N часов\n"
-        "/summary_days N — summary за N дней (например /summary_days 7)\n"
+        "/summary_days N — summary за N дней (пример: /summary_days 7)\n"
         "/clear — очистить сохраненные сообщения\n"
         "/enable_auto — включить авто-summary в 01:00 (для ЭТОГО чата)\n"
         "/disable_auto — выключить авто-summary (для ЭТОГО чата)\n\n"
@@ -144,6 +185,7 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat.id
     channel_messages.setdefault(chat_id, [])
 
+    # username / source
     if update.message and msg.from_user:
         user = msg.from_user.username or msg.from_user.first_name or "Unknown"
     else:
@@ -324,6 +366,7 @@ ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
 @app.on_event("startup")
 async def on_startup():
+    # Commands
     ptb_app.add_handler(CommandHandler("start", start))
     ptb_app.add_handler(CommandHandler("summary", summary_command))
     ptb_app.add_handler(CommandHandler("summary_yesterday", summary_yesterday))
@@ -333,13 +376,16 @@ async def on_startup():
     ptb_app.add_handler(CommandHandler("enable_auto", enable_auto_summary))
     ptb_app.add_handler(CommandHandler("disable_auto", disable_auto_summary))
 
+    # Collect ANY message except commands
     ptb_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_message))
 
     await ptb_app.initialize()
     await ptb_app.start()
 
+    # Scheduler
     asyncio.create_task(schedule_daily_summary(ptb_app))
 
+    # Webhook
     if BASE_URL:
         webhook_url = f"{BASE_URL}/telegram/{WEBHOOK_SECRET}"
         await ptb_app.bot.set_webhook(url=webhook_url)
