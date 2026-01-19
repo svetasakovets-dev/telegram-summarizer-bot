@@ -1,0 +1,4 @@
+python-telegram-bot>=20.0
+fastapi>=0.100
+uvicorn[standard]>=0.22
+groq
