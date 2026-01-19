@@ -30,31 +30,18 @@ if not GROQ_API_KEY:
 # =========================
 # BOT STATE (IN-MEMORY)
 # =========================
-# Messages per chat_id
-channel_messages = {}
-
-# Chats where auto-summary is enabled
-auto_summary_chats = set()
+channel_messages = {}          # messages per chat_id
+auto_summary_chats = set()     # chats where auto-summary is enabled
 
 
 # =========================
 # HELPERS
 # =========================
-def _chat_label(chat) -> str:
-    try:
-        if chat.title:
-            return chat.title
-    except Exception:
-        pass
-    return str(chat.id)
-
-
 def get_messages_by_timeframe(chat_id: int, hours: int = 24):
     messages = channel_messages.get(chat_id, [])
     if not messages:
         return []
 
-    # Use tz from Telegram timestamps if present
     tz = messages[-1]["timestamp"].tzinfo
     now = datetime.now(tz=tz) if tz else datetime.now()
     cutoff = now - timedelta(hours=hours)
@@ -66,28 +53,51 @@ async def generate_summary(messages):
     if not messages:
         return "No messages to summarize."
 
-    text = "\n\n".join(
+    messages_text = "\n\n".join(
         f"[{m['timestamp'].strftime('%H:%M')}] {m['user']}: {m['text']}"
         for m in messages
         if m.get("text")
     )
 
-    if not text.strip():
+    if not messages_text.strip():
         return "No text messages found to summarize."
 
     try:
         client = Groq(api_key=GROQ_API_KEY)
 
-        prompt = f"""Сделай краткое, структурированное резюме обсуждения.
+        prompt = f"""Ты делаешь краткое резюме мамского чата за период.
 
-Фокус:
-- Основные темы
-- Важные решения/факты
-- Объявления/обновления
-- Вопросы и action items
+ВАЖНО (включай в summary ТОЛЬКО если есть рекомендация или итог обсуждения):
+1) Массовые закупки / покупки:
+   - что В ИТОГЕ решили покупать
+   - если несколько человек поддержали выбор
+   - ссылку указывать ТОЛЬКО для итогового варианта
+2) Рекомендации:
+   - врачи / клиники / анализы / прививки
+   - товары / сервисы
+   - обязательно кратко: за что хвалят или за что ругают
+3) Полезная конкретика:
+   - списки, чек-листы
+   - цены, сроки, контакты
+   - где купить / как заказать
+
+НЕ ВАЖНО (сжать до минимума, не перечислять подробно):
+- одиночные ссылки без поддержки
+- варианты, по которым не договорились
+- болтовня, эмоции, small talk
+
+ФОРМАТ ОТВЕТА (строго):
+Mood: одна короткая строка про общий настрой чата.
+
+Полезное:
+- Массовые покупки / что решили брать: ...
+- Рекомендации (врачи / товары): ...
+- Полезные списки и конкретика: ...
+
+Болталка (1–2 строки): ...
 
 Сообщения:
-{text}
+{messages_text}
 
 Ответ дай дружелюбно и структурировано (пункты/подзаголовки).
 """
@@ -114,10 +124,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/summary — summary за 24 часа\n"
         "/summary_yesterday — summary за вчера (24–48ч назад)\n"
         "/summary_custom N — summary за N часов\n"
+        "/summary_days N — summary за N дней (например /summary_days 7)\n"
         "/clear — очистить сохраненные сообщения\n"
         "/enable_auto — включить авто-summary в 01:00 (для ЭТОГО чата)\n"
         "/disable_auto — выключить авто-summary (для ЭТОГО чата)\n\n"
-        "ℹ️ Важно: я отвечаю на команды, а обычные сообщения я просто сохраняю для summary."
+        "ℹ️ Я НЕ отвечаю на обычные сообщения — я их сохраняю для summary."
     )
 
 
@@ -133,7 +144,6 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat.id
     channel_messages.setdefault(chat_id, [])
 
-    # Username / source
     if update.message and msg.from_user:
         user = msg.from_user.username or msg.from_user.first_name or "Unknown"
     else:
@@ -160,6 +170,32 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = await generate_summary(msgs)
     await update.message.reply_text(
         f"📊 **Summary (24 часа)** ({len(msgs)} сообщений)\n\n{summary}",
+        parse_mode="Markdown",
+    )
+
+
+async def summary_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    try:
+        days = int(context.args[0]) if context.args else 1
+        if days < 1 or days > 30:
+            raise ValueError()
+    except Exception:
+        await update.message.reply_text("Пример: /summary_days 7 (1..30 дней)")
+        return
+
+    hours = days * 24
+    await update.message.reply_text(f"⏳ Генерирую summary за {days} дней...")
+
+    msgs = get_messages_by_timeframe(chat_id, hours=hours)
+    if not msgs:
+        await update.message.reply_text(f"📭 Нет сообщений за последние {days} дней.")
+        return
+
+    summary = await generate_summary(msgs)
+    await update.message.reply_text(
+        f"📊 **Summary ({days} дней)** ({len(msgs)} сообщений)\n\n{summary}",
         parse_mode="Markdown",
     )
 
@@ -288,25 +324,22 @@ ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
 @app.on_event("startup")
 async def on_startup():
-    # Commands
     ptb_app.add_handler(CommandHandler("start", start))
     ptb_app.add_handler(CommandHandler("summary", summary_command))
     ptb_app.add_handler(CommandHandler("summary_yesterday", summary_yesterday))
     ptb_app.add_handler(CommandHandler("summary_custom", summary_custom))
+    ptb_app.add_handler(CommandHandler("summary_days", summary_days))
     ptb_app.add_handler(CommandHandler("clear", clear_messages))
     ptb_app.add_handler(CommandHandler("enable_auto", enable_auto_summary))
     ptb_app.add_handler(CommandHandler("disable_auto", disable_auto_summary))
 
-    # Collect ANY message except commands (works reliably in supergroups too)
     ptb_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_message))
 
     await ptb_app.initialize()
     await ptb_app.start()
 
-    # Scheduler
     asyncio.create_task(schedule_daily_summary(ptb_app))
 
-    # Webhook
     if BASE_URL:
         webhook_url = f"{BASE_URL}/telegram/{WEBHOOK_SECRET}"
         await ptb_app.bot.set_webhook(url=webhook_url)
